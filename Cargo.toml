@@ -1,0 +1,13 @@
+[package]
+name = "tcp-queueing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+tokio = { version = "*", features = ["full"] }
+anyhow = "*"
+futures = "*"
+tokio-util = "*"
+
+mirrord-protocol = { git = "https://github.com/metalbear-co/mirrord.git", package = "mirrord-protocol", branch = "main" }
