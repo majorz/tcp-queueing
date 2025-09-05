@@ -11,3 +11,14 @@ futures = "*"
 tokio-util = "*"
 
 mirrord-protocol = { git = "https://github.com/metalbear-co/mirrord.git", package = "mirrord-protocol", branch = "main" }
+mirrord-macros = { git = "https://github.com/metalbear-co/mirrord.git", package = "mirrord-macros", branch = "main" }
+
+uuid = { version = "*", features = ["serde"] }
+bincode = { version = "*", features = ["serde", "derive"] }
+serde = { version = "*", features = ["derive"] }
+rand = "*"
+
+actix-codec = "*"
+bytes = "*"
+semver = "*"
+thiserror = "*"
