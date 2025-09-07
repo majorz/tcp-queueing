@@ -269,6 +269,9 @@ async fn sender_task(
                 match msg {
                     Some(msg) => {
                         let chunk_producer = ChunkProducer::<CHUNK_SIZE>::new(&msg).unwrap();
+
+                        drop(msg); // Drop early the original message to free memory
+
                         for chunk in chunk_producer {
                             group_queue.push_chunk(chunk);
                         }
