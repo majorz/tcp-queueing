@@ -34,7 +34,7 @@ use mirrord_protocol::{
 #[allow(deprecated)]
 use mirrord_protocol::pause::DaemonPauseTarget;
 
-use crate::chunk::{Chunk, ChunkIterator, ChunkWrapper};
+use crate::chunk::{Chunk, ChunkProducer, GroupChunkCollector, GroupChunkQueue};
 
 const SERVER_ADDRESS: &str = "127.0.0.1:3333";
 
@@ -91,7 +91,7 @@ pub enum ClientMessage {
     ///
     /// Has the same ID that we got from the [`DaemonMessage::OperatorPing`].
     OperatorPong(u128),
-
+    /// A chunk of a larger `ClientMessage`.
     Chunk(Chunk),
 }
 
@@ -123,14 +123,8 @@ pub enum DaemonMessage {
     ///
     /// Holds the unique id of this ping.
     OperatorPing(u128),
-
+    /// A chunk of a larger `DaemonMessage`.
     Chunk(Chunk),
-}
-
-impl ChunkWrapper for DaemonMessage {
-    fn wrap_chunk(chunk: Chunk) -> Self {
-        DaemonMessage::Chunk(chunk)
-    }
 }
 
 pub struct ProtocolCodec<I, O> {
@@ -251,13 +245,7 @@ async fn handle_client_message(
             };
             let msg = DaemonMessage::TcpOutgoing(DaemonTcpOutgoing::Read(Ok(read)));
 
-            // Split into chunks
-            let chunk_iter = ChunkIterator::<CHUNK_SIZE, DaemonMessage>::new(&msg)?;
-            for chunk_msg in chunk_iter {
-                tx_out.send(chunk_msg).await?;
-            }
-
-            //            tx_out.send(msg).await?;
+            tx_out.send(msg).await?;
         }
         ClientMessage::Ping => {
             tx_out.send(DaemonMessage::Pong).await?;
@@ -267,15 +255,36 @@ async fn handle_client_message(
     Ok(())
 }
 
-/// Continuously receives DaemonMessages and sends them to the client
+/// Continuously receives `DaemonMessage`s, splits into chunks, and sends them randomly
 async fn sender_task(
     mut rx: mpsc::Receiver<DaemonMessage>,
     mut sink: SplitSink<Framed<TcpStream, DaemonCodec>, DaemonMessage>,
 ) {
-    while let Some(msg) = rx.recv().await {
-        if let Err(e) = sink.send(msg).await {
-            eprintln!("Error sending message to client: {:?}", e);
-            break;
+    let mut group_queue = GroupChunkQueue::new();
+
+    loop {
+        tokio::select! {
+            // Prioritize receiving new messages
+            msg = rx.recv() => {
+                match msg {
+                    Some(msg) => {
+                        let chunk_producer = ChunkProducer::<CHUNK_SIZE>::new(&msg).unwrap();
+                        for chunk in chunk_producer {
+                            group_queue.push_chunk(chunk);
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            // If we have chunks, send the next one
+            _ = async {}, if !group_queue.is_empty() => {
+                if let Some(chunk) = group_queue.pop_random_chunk()
+                    && let Err(e) = sink.send(DaemonMessage::Chunk(chunk)).await {
+                    eprintln!("Error sending chunk: {:?}", e);
+                    break;
+                }
+            }
         }
     }
 }
@@ -312,13 +321,26 @@ async fn measure_ping(framed: &mut Framed<TcpStream, ClientCodec>) -> Result<()>
     let start = Instant::now();
     framed.send(ClientMessage::Ping).await?;
 
+    let mut collector = GroupChunkCollector::new();
+
     let result = timeout(Duration::from_millis(PING_TIMEOUT_MS), async {
         while let Some(msg) = framed.next().await {
             match msg? {
                 DaemonMessage::Pong => return Ok::<(), anyhow::Error>(()),
                 DaemonMessage::Chunk(chunk) => {
-                    // Handle chunked messages if needed
-                    println!("Received chunk: {:?}", chunk);
+                    if let Some(chunks) = collector.push(chunk) {
+                        // We now have a complete group of chunks
+                        let mut reader = ChunkReader::new(chunks);
+
+                        let decoded_msg = reader.decode().unwrap();
+
+                        if let DaemonMessage::Pong = decoded_msg {
+                            println!("Received Pong!");
+                            return Ok(());
+                        } else {
+                            println!("Received unexpected message: {:?}", decoded_msg);
+                        }
+                    }
                 }
                 _ => continue,
             }
@@ -344,16 +366,7 @@ fn into_chunks() {
         bytes: vec![0u8; 1_000_000].into(),
     })));
 
-    let chunks: Vec<_> = ChunkIterator::<CHUNK_SIZE, DaemonMessage>::new(&msg)
-        .unwrap()
-        .filter_map(|msg| {
-            if let DaemonMessage::Chunk(chunk) = msg {
-                Some(chunk)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let chunks: Vec<_> = ChunkProducer::<CHUNK_SIZE>::new(&msg).unwrap().collect();
 
     println!("Message split into {} chunks.", chunks.len());
 

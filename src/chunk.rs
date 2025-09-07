@@ -1,11 +1,22 @@
-use std::collections::VecDeque;
+//! # Chunked Serialization Module
+//!
+//! This module provides utilities for splitting large messages or payloads into smaller `Chunk`s,
+//! transmitting them, and reconstructing them. It is designed for scenarios where fixed-size
+//! fragments are preferred, such as network transport, storage, or messaging systems.
+//!
+//! Chunks are grouped by a `group_id` representing a logical message. The `ChunkProducer` and
+//! `ChunkReader` abstractions handle serialization and deserialization seamlessly across
+//! multiple fragments. Randomized group processing is supported via `GroupChunkQueue`.
 
+use std::collections::{HashMap, VecDeque};
+
+use bincode::{Decode, Encode, encode_into_writer, decode_from_reader};
+use bincode::error::{EncodeError, DecodeError};
 use bincode::de::read::Reader;
 use bincode::enc::write::Writer;
-use bincode::encode_into_writer;
-use bincode::error::{DecodeError, EncodeError};
-use bincode::{Decode, Encode};
 use bytes::{Bytes, BytesMut};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 
 use mirrord_protocol::payload::Payload;
 
@@ -21,17 +32,17 @@ pub struct Chunk {
     pub group_id: u8,
 
     /// Index of this chunk within the group.
-    pub index: usize,
+    pub index: u64,
 
     /// Total number of chunks in the group.
-    pub total: usize,
+    pub total: u64,
 
     /// Data payload contained in this chunk.
     pub payload: Payload,
 }
 
 impl Chunk {
-    pub fn new(group_id: u8, index: usize, total: usize, payload: Payload) -> Self {
+    pub fn new(group_id: u8, index: u64, total: u64, payload: Payload) -> Self {
         Self {
             group_id,
             index,
@@ -120,32 +131,21 @@ impl<const FRAGMENT_SIZE: usize> Writer for FragmentWriter<FRAGMENT_SIZE> {
     }
 }
 
-/// A trait for types that can be constructed from multiple `Chunk`s.
-///
-/// This is useful when a type can be split into multiple chunks for serialization
-/// or transmission, but can also hold just a single chunk.
-pub trait ChunkWrapper {
-    fn wrap_chunk(chunk: Chunk) -> Self;
-}
-
-/// An iterator that produces `ChunkWrapper` instances from a serializable value.
+/// An iterator that produces `Chunk`s from a serializable value.
 ///
 /// This iterator takes a value that implements `bincode::Encode`, serializes it into
-/// fixed-size fragments using `FragmentWriter` and then yields each fragment as a
-/// `Chunk` wrapped in a `ChunkWrapper` instance.
+/// fixed-size fragments using `FragmentWriter` and then yields each fragment as `Chunk`
 ///
 /// # Type Parameters
 /// - `FRAGMENT_SIZE`: The maximum size of each fragment in bytes.
-/// - `C`: The type that implements `ChunkWrapper` and can be constructed from series of `Chunk`s.
-pub struct ChunkIterator<const FRAGMENT_SIZE: usize, C: ChunkWrapper> {
+pub struct ChunkProducer<const FRAGMENT_SIZE: usize> {
     fragments: VecDeque<Bytes>,
     group_id: u8,
-    total: usize,
-    _phantom: std::marker::PhantomData<C>,
+    total: u64,
 }
 
-impl<const FRAGMENT_SIZE: usize, C: ChunkWrapper> ChunkIterator<FRAGMENT_SIZE, C> {
-    /// Create a new `ChunkIterator` from a serializable value.
+impl<const FRAGMENT_SIZE: usize> ChunkProducer<FRAGMENT_SIZE> {
+    /// Create a new `ChunkProducer` from a serializable value.
     ///
     /// This method serializes the given value using `bincode` and splits it into
     /// fragments of size `FRAGMENT_SIZE`. The first byte of the first fragment is
@@ -166,29 +166,28 @@ impl<const FRAGMENT_SIZE: usize, C: ChunkWrapper> ChunkIterator<FRAGMENT_SIZE, C
                 EncodeError::OtherString("No data encoded into fragments".to_string())
             })?;
 
-        let total = fragments.len();
+        let total = fragments.len() as u64;
 
         Ok(Self {
             fragments,
             group_id,
             total,
-            _phantom: std::marker::PhantomData,
         })
     }
 }
 
-impl<const FRAGMENT_SIZE: usize, C: ChunkWrapper> Iterator for ChunkIterator<FRAGMENT_SIZE, C> {
-    type Item = C;
+impl<const FRAGMENT_SIZE: usize> Iterator for ChunkProducer<FRAGMENT_SIZE> {
+    type Item = Chunk;
 
-    /// Return the next chunk wrapped in the `ChunkWrapper`.
+    /// Return the next chunk.
     ///
     /// Each call to `next` yields the next chunk, along with its index and the
     /// total number of chunks. When all chunks have been consumed, it returns `None`.
     fn next(&mut self) -> Option<Self::Item> {
-        let index = self.total - self.fragments.len();
+        let index = self.total - self.fragments.len() as u64;
         let bytes = self.fragments.pop_front()?;
         let chunk = Chunk::new(self.group_id, index, self.total, Payload::from(bytes));
-        Some(C::wrap_chunk(chunk))
+        Some(chunk)
     }
 }
 
@@ -221,12 +220,19 @@ impl ChunkReader {
         }
     }
 
+    /// Decode a value from the chunks using bincode standard config.
+    pub fn decode<T: Decode<()>>(&mut self) -> Result<T, DecodeError> {
+        decode_from_reader(self, bincode::config::standard())
+    }
+
     /// Returns the current chunk's payload as a byte slice.
+    #[inline]
     fn payload(&self) -> Option<&Bytes> {
         self.chunks.get(self.chunk_index).map(|c| &c.payload.0)
     }
 
     /// Advances to the next chunk if the current one is fully consumed.
+    #[inline]
     fn next_chunk(&mut self) {
         if let Some(payload) = self.payload()
             && self.offset >= payload.len()
@@ -264,5 +270,115 @@ impl Reader for ChunkReader {
         }
 
         Ok(())
+    }
+}
+
+/// A queue that holds chunks grouped by `group_id` and allows random selection when popping.
+///
+/// This structure is useful for sending chunked messages with a randomized group order
+/// while maintaining the order of chunks within a group.
+pub struct GroupChunkQueue {
+    // Maps group_id to its queued chunks
+    groups: HashMap<u8, VecDeque<Chunk>>,
+
+    // Active group IDs for random selection synced with `groups` keys
+    group_ids: Vec<u8>,
+
+    // Non-cryptographic RNG for quick random rotation
+    rng: SmallRng,
+}
+
+impl GroupChunkQueue {
+    pub fn new() -> Self {
+        Self {
+            groups: HashMap::new(),
+            group_ids: Vec::new(),
+            rng: SmallRng::from_seed([0; 32]),
+        }
+    }
+
+    /// Pushes a single chunk into the queue.
+    pub fn push_chunk(&mut self, chunk: Chunk) {
+        let group_id = chunk.group_id;
+
+        // Get or create the queue for this group
+        let queue = self.groups.entry(group_id).or_default();
+
+        // Sync the group_id if it is newly added
+        if queue.is_empty() {
+            self.group_ids.push(group_id);
+        }
+
+        queue.push_back(chunk);
+    }
+
+    /// Pops the front chunk from a randomly selected active group
+    pub fn pop_random_chunk(&mut self) -> Option<Chunk> {
+        if self.group_ids.is_empty() {
+            return None;
+        }
+
+        // Pick a random group index
+        let idx = self.rng.random_range(0..self.group_ids.len());
+        let group_id = self.group_ids[idx];
+
+        // Pop the first chunk from the selected group queue
+        let queue = self.groups.get_mut(&group_id)?;
+        let chunk = queue.pop_front();
+
+        // Remove the group if it becomes empty
+        if queue.is_empty() {
+            self.groups.remove(&group_id);
+            self.group_ids.swap_remove(idx); // O(1) removal
+        }
+
+        chunk
+    }
+
+    /// Returns true if there are no chunks in any group
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+}
+
+/// Collector for partially received chunks within groups.
+///
+/// This ensures that chunks are stored in order and can be assembled into a complete message.
+pub struct GroupChunkCollector {
+    // Maps group_id to its received chunks
+    groups: HashMap<u8, Vec<Chunk>>,
+}
+
+impl GroupChunkCollector {
+    pub fn new() -> Self {
+        Self {
+            groups: HashMap::new(),
+        }
+    }
+
+    /// Adds a chunk to the corresponding group.
+    ///
+    /// If this chunk completes its group, the function returns all collected chunks for that group.
+    ///
+    /// If a chunk with `index == 0` arrives, any previously collected chunks for that group are
+    /// discarded.
+    pub fn push(&mut self, chunk: Chunk) -> Option<Vec<Chunk>> {
+        // If a chunk with index 0 arrives, drop any previously collected chunks
+        if chunk.index == 0 && self.groups.contains_key(&chunk.group_id) {
+            // TODO: Handle or log discarded chunks
+            self.groups.remove(&chunk.group_id);
+        }
+
+        let entry = self.groups.entry(chunk.group_id).or_default();
+        entry.push(chunk.clone());
+
+        // Check if this is the last chunk of the group
+        if chunk.index + 1 == chunk.total {
+            // Take the completed group
+            let complete_chunks = self.groups.remove(&chunk.group_id).unwrap();
+            Some(complete_chunks)
+        } else {
+            None
+        }
     }
 }
