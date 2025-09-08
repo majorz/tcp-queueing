@@ -1,12 +1,12 @@
 //! # Chunked Serialization Module
 //!
-//! This module provides utilities for splitting large messages or payloads into smaller `Chunk`s,
-//! transmitting them, and reconstructing them. It is designed for scenarios where fixed-size
-//! fragments are preferred, such as network transport, storage, or messaging systems.
+//! This module provides utilities for splitting large messages or payloads into smaller `Chunk`s
+//! for transmission and for reconstructing them on the receiving end. It is designed for scenarios
+//! where fixed-size fragments are preferred, such as network transport or storage.
 //!
-//! Chunks are grouped by a `group_id` representing a logical message. The `ChunkProducer` and
-//! `ChunkReader` abstractions handle serialization and deserialization seamlessly across
-//! multiple fragments. Randomized group processing is supported via `GroupChunkQueue`.
+//! `ChunkProducer` and `ChunkReader` handle serialization and deserialization across multiple 
+//! chunk fragments. `GroupChunkQueue` enables randomized group-based processing.
+//! `GroupChunkCollector` manages chunk assembly into complete messages.
 
 use std::collections::{HashMap, VecDeque};
 
