@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use actix_codec::{Decoder, Encoder};
 use anyhow::Result;
@@ -13,9 +14,10 @@ use bincode::{Decode, Encode};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
+
 
 use mirrord_macros::protocol_break;
 
@@ -260,6 +262,7 @@ async fn sender_task(
     mut rx: mpsc::Receiver<DaemonMessage>,
     mut sink: SplitSink<Framed<TcpStream, DaemonCodec>, DaemonMessage>,
 ) {
+    let notify = Arc::new(Notify::new());
     let mut group_queue = GroupChunkQueue::new();
 
     loop {
@@ -275,13 +278,15 @@ async fn sender_task(
                         for chunk in chunk_producer {
                             group_queue.push_chunk(chunk);
                         }
+
+                        notify.notify_one();
                     }
                     None => break,
                 }
             }
 
-            // If we have chunks, send the next one
-            _ = async {}, if !group_queue.is_empty() => {
+            // Wait for a chunk to be ready and send it
+            _ = notify.notified(), if !group_queue.is_empty() => {
                 if let Some(chunk) = group_queue.pop_random_chunk()
                     && let Err(e) = sink.send(DaemonMessage::Chunk(chunk)).await {
                     eprintln!("Error sending chunk: {:?}", e);
