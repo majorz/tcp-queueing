@@ -13,6 +13,7 @@ use bincode::error::DecodeError;
 use bincode::{Decode, Encode};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt, stream::SplitSink};
+use mirrord_protocol::Payload;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
@@ -52,6 +53,101 @@ const PING_TIMEOUT_MS: u64 = 200;
 ////////////////////////////////////////////////////////////////////
 // codec.rs
 //
+
+#[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
+pub enum OwnedChunk {
+    Start {
+        message_id: u16,
+        total_length: u64,
+        data: Payload,
+    },
+    Data {
+        message_id: u16,
+        data: Payload,
+    },
+}
+
+impl OwnedChunk {
+    pub fn message_id(&self) -> u16 {
+        match self {
+            OwnedChunk::Start { message_id, .. } => *message_id,
+            OwnedChunk::Data { message_id, .. } => *message_id,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            OwnedChunk::Start { data, .. } => data.len(),
+            OwnedChunk::Data { data, .. } => data.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            OwnedChunk::Start { data, .. } => data.is_empty(),
+            OwnedChunk::Data { data, .. } => data.is_empty(),
+        }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        match self {
+            OwnedChunk::Start { data, .. } => data,
+            OwnedChunk::Data { data, .. } => data,
+        }
+    }
+
+    pub fn is_start(&self) -> bool {
+        matches!(self, OwnedChunk::Start { .. })
+    }
+}
+
+impl<'a> From<Chunk<'a>> for OwnedChunk {
+    fn from(chunk: Chunk<'a>) -> Self {
+        match chunk {
+            Chunk::Start { message_id, total_length, data } => {
+                OwnedChunk::Start {
+                    message_id,
+                    total_length,
+                    data: Payload::from(data.into_owned()), // Cow -> Vec/Bytes
+                }
+            }
+            Chunk::Data { message_id, data } => {
+                OwnedChunk::Data {
+                    message_id,
+                    data: Payload::from(data.into_owned()),
+                }
+            }
+        }
+    }
+}
+
+use std::borrow::Cow;
+
+impl From<OwnedChunk> for Chunk<'static> {
+    fn from(chunk: OwnedChunk) -> Self {
+        match chunk {
+            OwnedChunk::Start { message_id, total_length, data } => {
+                Chunk::Start {
+                    message_id,
+                    total_length,
+                    data: Cow::Owned(data.0.into()),
+                }
+            }
+            OwnedChunk::Data { message_id, data } => {
+                Chunk::Data {
+                    message_id,
+                    data: Cow::Owned(data.0.into()),
+                }
+            }
+        }
+    }
+}
+
+impl Chunk<'static> {
+    pub fn from_owned(chunk: OwnedChunk) -> Self {
+        chunk.into()
+    }
+}
 
 /// `-layer` --> `-agent` messages.
 #[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
@@ -94,7 +190,7 @@ pub enum ClientMessage {
     /// Has the same ID that we got from the [`DaemonMessage::OperatorPing`].
     OperatorPong(u128),
     /// A chunk of a larger `ClientMessage`.
-    Chunk(Chunk),
+    Chunk(OwnedChunk),
 }
 
 /// `-agent` --> `-layer` messages.
@@ -126,7 +222,7 @@ pub enum DaemonMessage {
     /// Holds the unique id of this ping.
     OperatorPing(u128),
     /// A chunk of a larger `DaemonMessage`.
-    Chunk(Chunk),
+    Chunk(OwnedChunk),
 }
 
 pub struct ProtocolCodec<I, O> {
@@ -288,7 +384,7 @@ async fn sender_task(
             // Wait for a chunk to be ready and send it
             _ = notify.notified(), if !group_queue.is_empty() => {
                 if let Some(chunk) = group_queue.pop_random_chunk()
-                    && let Err(e) = sink.send(DaemonMessage::Chunk(chunk)).await {
+                    && let Err(e) = sink.send(DaemonMessage::Chunk(chunk.into())).await {
                     eprintln!("Error sending chunk: {:?}", e);
                     break;
                 }
@@ -336,7 +432,7 @@ async fn measure_ping(framed: &mut Framed<TcpStream, ClientCodec>) -> Result<()>
             match msg? {
                 DaemonMessage::Pong => return Ok::<(), anyhow::Error>(()),
                 DaemonMessage::Chunk(chunk) => {
-                    if let Some(chunks) = collector.push(chunk) {
+                    if let Some(chunks) = collector.push(chunk.into()) {
                         // We now have a complete group of chunks
                         let mut reader = ChunkReader::new(chunks);
 
