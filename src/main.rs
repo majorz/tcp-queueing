@@ -45,11 +45,19 @@ const CHANNEL_CAPACITY: usize = 1000;
 
 const PING_TIMEOUT_MS: u64 = 200;
 
+const CHUNK_SIZE: usize = 32 * 1024; // 32 KB
+
 // const TCP_DELAY_MS: u64 = 10;
 
 ////////////////////////////////////////////////////////////////////
 // codec.rs
 //
+
+#[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
+pub enum ProtocolFlavor {
+    Standard,
+    Chunked,
+}
 
 /// `-layer` --> `-agent` messages.
 #[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
@@ -91,8 +99,11 @@ pub enum ClientMessage {
     ///
     /// Has the same ID that we got from the [`DaemonMessage::OperatorPing`].
     OperatorPong(u128),
-    /// A chunk of a larger `ClientMessage`.
     Chunk(Chunk),
+    /// Client demands switching the protocol.
+    /// After receiving [`DaemonMessage::ProtocolSwitched`] the client can recover the raw IO stream and apply the protocol-specific codec.
+    /// After sending this message, the client must suspend sending messages until [`DaemonMessage::ProtocolSwitched`] is received.
+    SwitchProtocol(ProtocolFlavor),
 }
 
 /// `-agent` --> `-layer` messages.
@@ -123,8 +134,10 @@ pub enum DaemonMessage {
     ///
     /// Holds the unique id of this ping.
     OperatorPing(u128),
-    /// A chunk of a larger `DaemonMessage`.
     Chunk(Chunk),
+    /// Informs the client that the protocol has been switched according to the [`ClientMessage::SwitchProtocol`] request.
+    /// After sending this message, the daemon can recover the raw IO stream and apply the protocol-specific codec.
+    ProtocolSwitched,
 }
 
 pub struct ProtocolCodec<I, O> {
@@ -184,72 +197,169 @@ impl<I, O: bincode::Encode> Encoder<O> for ProtocolCodec<I, O> {
     }
 }
 
+pub type ChunkCodec = ProtocolCodec<Chunk, Chunk>;
+
 //////////////////////////////////////////////////////////////////////
 
-const CHUNK_SIZE: usize = 32 * 1024; // 32 KB
+pub struct Client {}
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Run server and client concurrently
-    tokio::try_join!(run_server(), run_client())?;
-    Ok(())
+impl Client {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    async fn run(mut self) -> Result<()> {
+        let socket = TcpStream::connect(SERVER_ADDRESS).await?;
+        let mut framed = Framed::new(socket, ClientCodec::default());
+
+        self.send_heavy_messages(&mut framed).await?;
+        self.measure_ping(&mut framed).await?;
+        println!("Client finished.");
+        Ok(())
+    }
+
+    async fn send_heavy_messages(
+        &mut self,
+        framed: &mut Framed<TcpStream, ClientCodec>,
+    ) -> Result<()> {
+        for i in 0..MESSAGE_COUNT {
+            let write = LayerWrite {
+                connection_id: i as u64,
+                bytes: vec![0u8; MESSAGE_SIZE].into(),
+            };
+            framed
+                .send(ClientMessage::TcpOutgoing(LayerTcpOutgoing::Write(write)))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Sends a Ping and waits for a Pong with a timeout, printing latency
+    async fn measure_ping(&mut self, framed: &mut Framed<TcpStream, ClientCodec>) -> Result<()> {
+        let start = Instant::now();
+        framed.send(ClientMessage::Ping).await?;
+
+        let mut collector = GroupChunkCollector::new();
+
+        let result = timeout(Duration::from_millis(PING_TIMEOUT_MS), async {
+            while let Some(msg) = framed.next().await {
+                match msg? {
+                    DaemonMessage::Pong => return Ok::<(), anyhow::Error>(()),
+                    DaemonMessage::Chunk(chunk) => {
+                        if let Some(chunks) = collector.push(chunk) {
+                            // We now have a complete group of chunks
+                            let mut reader = ChunkReader::new(chunks);
+
+                            let decoded_msg = reader.decode().unwrap();
+
+                            if let DaemonMessage::Pong = decoded_msg {
+                                println!("Received Pong!");
+                                return Ok(());
+                            } else {
+                                println!("Received unexpected message: {:?}", decoded_msg);
+                            }
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            Ok(())
+        })
+        .await;
+
+        match result {
+            Ok(_) => println!("Ping responded in {:?}", start.elapsed()),
+            Err(_) => println!("Ping timed out after {:?}", start.elapsed()),
+        }
+
+        Ok(())
+    }
 }
 
-/// Runs the server, accepts a single client and processes incoming messages.
-/// TcpOutgoing messages are handled with artificial delay to simulate heavy traffic.
-async fn run_server() -> Result<()> {
-    let listener = TcpListener::bind(SERVER_ADDRESS).await?;
-    println!("Server listening on {}", SERVER_ADDRESS);
+impl Default for Client {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    let (socket, _) = listener.accept().await?;
-    let framed = Framed::new(socket, DaemonCodec::default());
-    let (sink, mut stream) = framed.split();
+pub struct Server {}
 
-    let (tx_out, rx_out) = mpsc::channel::<DaemonMessage>(CHANNEL_CAPACITY);
+impl Server {
+    pub fn new() -> Self {
+        Self {}
+    }
 
-    tokio::spawn(sender_task(rx_out, sink));
+    /// Runs the server loop: handles incoming messages and sends responses
+    pub async fn run(self) -> Result<()> {
+        let listener = TcpListener::bind(SERVER_ADDRESS).await?;
+        println!("Server listening on {}", SERVER_ADDRESS);
 
-    while let Some(msg) = stream.next().await {
-        match msg {
-            Ok(client_msg) => {
-                if let Err(e) = handle_client_message(client_msg, &tx_out).await {
-                    eprintln!("Error handling message: {:?}", e);
+        let (stream, _) = listener.accept().await?;
+
+        let framed = Framed::new(stream, DaemonCodec::default());
+
+        // Split the framed stream into sink & stream
+        let (sink, mut stream) = framed.split();
+
+        let (tx_out, rx_out) = mpsc::channel::<DaemonMessage>(CHANNEL_CAPACITY);
+
+        tokio::spawn(sender_task(rx_out, sink));
+
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(client_msg) => {
+                    if let Err(e) = self.handle_client_message(client_msg, &tx_out).await {
+                        eprintln!("Error handling message: {:?}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error reading from client: {:?}", e);
                     break;
                 }
             }
-            Err(e) => {
-                eprintln!("Error reading from client: {:?}", e);
-                break;
-            }
         }
+
+        println!("Server shutting down.");
+        Ok(())
     }
 
-    println!("Server shutting down.");
-    Ok(())
+    /// Handles individual client messages
+    async fn handle_client_message(
+        &self,
+        msg: ClientMessage,
+        tx_out: &mpsc::Sender<DaemonMessage>,
+    ) -> Result<()> {
+        match msg {
+            ClientMessage::TcpOutgoing(LayerTcpOutgoing::Write(tcp)) => {
+                let read = DaemonRead {
+                    connection_id: tcp.connection_id,
+                    bytes: tcp.bytes,
+                };
+                let response = DaemonMessage::TcpOutgoing(DaemonTcpOutgoing::Read(Ok(read)));
+                tx_out.send(response).await?;
+            }
+            ClientMessage::Ping => {
+                tx_out.send(DaemonMessage::Pong).await?;
+            }
+            _ => {} // ignore others for now
+        }
+        Ok(())
+    }
 }
 
-/// Processes ClientMessage sending a response via the channel
-async fn handle_client_message(
-    msg: ClientMessage,
-    tx_out: &mpsc::Sender<DaemonMessage>,
-) -> Result<()> {
-    match msg {
-        ClientMessage::TcpOutgoing(LayerTcpOutgoing::Write(tcp)) => {
-            // Simulate heavy processing
-            //            tokio::time::sleep(Duration::from_millis(TCP_DELAY_MS)).await;
-            let read = DaemonRead {
-                connection_id: tcp.connection_id,
-                bytes: tcp.bytes,
-            };
-            let msg = DaemonMessage::TcpOutgoing(DaemonTcpOutgoing::Read(Ok(read)));
-
-            tx_out.send(msg).await?;
-        }
-        ClientMessage::Ping => {
-            tx_out.send(DaemonMessage::Pong).await?;
-        }
-        _ => {} // Ignore other messages for now
+impl Default for Server {
+    fn default() -> Self {
+        Self::new()
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let server = Server::new();
+    let client = Client::new();
+    // Run server and client concurrently
+    tokio::try_join!(server.run(), client.run())?;
     Ok(())
 }
 
@@ -291,72 +401,4 @@ async fn sender_task(
             }
         }
     }
-}
-
-/// Runs the client sending heavy messages and measuring ping latency
-async fn run_client() -> Result<()> {
-    let socket = TcpStream::connect(SERVER_ADDRESS).await?;
-    let mut framed = Framed::new(socket, ClientCodec::default());
-
-    send_heavy_messages(&mut framed).await?;
-
-    measure_ping(&mut framed).await?;
-
-    println!("Client finished.");
-    Ok(())
-}
-
-/// Sends a sequence of large TCPOutgoing messages to the server
-async fn send_heavy_messages(framed: &mut Framed<TcpStream, ClientCodec>) -> Result<()> {
-    for i in 0..MESSAGE_COUNT {
-        let write = LayerWrite {
-            connection_id: i as u64,
-            bytes: vec![0u8; MESSAGE_SIZE].into(),
-        };
-        framed
-            .send(ClientMessage::TcpOutgoing(LayerTcpOutgoing::Write(write)))
-            .await?;
-    }
-    Ok(())
-}
-
-/// Sends a Ping and waits for a Pong with a timeout, printing latency
-async fn measure_ping(framed: &mut Framed<TcpStream, ClientCodec>) -> Result<()> {
-    let start = Instant::now();
-    framed.send(ClientMessage::Ping).await?;
-
-    let mut collector = GroupChunkCollector::new();
-
-    let result = timeout(Duration::from_millis(PING_TIMEOUT_MS), async {
-        while let Some(msg) = framed.next().await {
-            match msg? {
-                DaemonMessage::Pong => return Ok::<(), anyhow::Error>(()),
-                DaemonMessage::Chunk(chunk) => {
-                    if let Some(chunks) = collector.push(chunk) {
-                        // We now have a complete group of chunks
-                        let mut reader = ChunkReader::new(chunks);
-
-                        let decoded_msg = reader.decode().unwrap();
-
-                        if let DaemonMessage::Pong = decoded_msg {
-                            println!("Received Pong!");
-                            return Ok(());
-                        } else {
-                            println!("Received unexpected message: {:?}", decoded_msg);
-                        }
-                    }
-                }
-                _ => continue,
-            }
-        }
-        Ok(())
-    })
-    .await;
-
-    match result {
-        Ok(_) => println!("Ping responded in {:?}", start.elapsed()),
-        Err(_) => println!("Ping timed out after {:?}", start.elapsed()),
-    }
-
-    Ok(())
 }
