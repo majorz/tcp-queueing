@@ -4,16 +4,16 @@
 //! for transmission and for reconstructing them on the receiving end. It is designed for scenarios
 //! where fixed-size fragments are preferred, such as network transport or storage.
 //!
-//! `ChunkProducer` and `ChunkReader` handle serialization and deserialization across multiple 
-//! chunk fragments. `GroupChunkQueue` enables randomized group-based processing.
+//! `ChunkProducer` and `ChunkReader` handle serialization and deserialization across multiple
+//! chunk fragments. `GroupChunkQueue` enables randomized message group-based processing.
 //! `GroupChunkCollector` manages chunk assembly into complete messages.
 
 use std::collections::{HashMap, VecDeque};
 
-use bincode::{Decode, Encode, encode_into_writer, decode_from_reader};
-use bincode::error::{EncodeError, DecodeError};
 use bincode::de::read::Reader;
 use bincode::enc::write::Writer;
+use bincode::error::{DecodeError, EncodeError};
+use bincode::{Decode, Encode, decode_from_reader, encode_into_writer};
 use bytes::{Bytes, BytesMut};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -27,28 +27,64 @@ use mirrord_protocol::payload::Payload;
 /// contains metadata that allows the receiver to reassemble the original
 /// data correctly.
 #[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
-pub struct Chunk {
-    /// Identifier for the group of chunks that belong to the same message.
-    pub group_id: u8,
+pub enum Chunk {
+    Start {
+        /// Message ID for grouping related chunks
+        message_id: u16,
 
-    /// Index of this chunk within the group.
-    pub index: u64,
+        /// Total length of the original message in bytes
+        total_length: u64,
 
-    /// Total number of chunks in the group.
-    pub total: u64,
+        /// The actual data payload of this chunk
+        data: Payload,
+    },
+    Data {
+        /// Message ID for grouping related chunks
+        message_id: u16,
 
-    /// Data payload contained in this chunk.
-    pub payload: Payload,
+        /// The actual data payload of this chunk
+        data: Payload,
+    },
 }
 
 impl Chunk {
-    pub fn new(group_id: u8, index: u64, total: u64, payload: Payload) -> Self {
-        Self {
-            group_id,
-            index,
-            total,
-            payload,
+    pub fn message_id(&self) -> u16 {
+        match self {
+            Chunk::Start { message_id, .. } => *message_id,
+            Chunk::Data { message_id, .. } => *message_id,
         }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Chunk::Start { data, .. } => data.len(),
+            Chunk::Data { data, .. } => data.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Chunk::Start { data, .. } => data.is_empty(),
+            Chunk::Data { data, .. } => data.is_empty(),
+        }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        match self {
+            Chunk::Start { data, .. } => data,
+            Chunk::Data { data, .. } => data,
+        }
+    }
+
+    pub fn bytes(&self) -> &Bytes {
+        match self {
+            Chunk::Start { data, .. } => data,
+            Chunk::Data { data, .. } => data,
+        }
+    }
+
+    pub fn is_start(&self) -> bool {
+        matches!(self, Chunk::Start { .. })
     }
 }
 
@@ -67,6 +103,9 @@ pub struct FragmentWriter<const FRAGMENT_SIZE: usize> {
 
     /// Temporary storage for data being accumulated
     pending_fragment: BytesMut,
+
+    /// Total length of data written
+    total_length: usize,
 }
 
 impl<const FRAGMENT_SIZE: usize> FragmentWriter<FRAGMENT_SIZE> {
@@ -74,6 +113,7 @@ impl<const FRAGMENT_SIZE: usize> FragmentWriter<FRAGMENT_SIZE> {
         Self {
             fragments: VecDeque::new(),
             pending_fragment: BytesMut::with_capacity(FRAGMENT_SIZE),
+            total_length: 0,
         }
     }
 
@@ -83,9 +123,9 @@ impl<const FRAGMENT_SIZE: usize> FragmentWriter<FRAGMENT_SIZE> {
     }
 
     /// Consume this writer and return all completed fragments
-    pub fn finalize(mut self) -> VecDeque<Bytes> {
+    pub fn finalize(mut self) -> (VecDeque<Bytes>, usize) {
         self.flush_pending();
-        self.fragments
+        (self.fragments, self.total_length)
     }
 
     /// Flush the current pending fragment into the completed fragments queue
@@ -93,6 +133,7 @@ impl<const FRAGMENT_SIZE: usize> FragmentWriter<FRAGMENT_SIZE> {
         if self.pending_fragment.is_empty() {
             return;
         }
+        self.total_length += self.pending_fragment.len();
         let bytes = self.pending_fragment.split().freeze();
         self.fragments.push_back(bytes);
     }
@@ -140,8 +181,9 @@ impl<const FRAGMENT_SIZE: usize> Writer for FragmentWriter<FRAGMENT_SIZE> {
 /// - `FRAGMENT_SIZE`: The maximum size of each fragment in bytes.
 pub struct ChunkProducer<const FRAGMENT_SIZE: usize> {
     fragments: VecDeque<Bytes>,
-    group_id: u8,
-    total: u64,
+    message_id: u16,
+    total_length: usize,
+    chunk_count: usize,
 }
 
 impl<const FRAGMENT_SIZE: usize> ChunkProducer<FRAGMENT_SIZE> {
@@ -149,29 +191,29 @@ impl<const FRAGMENT_SIZE: usize> ChunkProducer<FRAGMENT_SIZE> {
     ///
     /// This method serializes the given value using `bincode` and splits it into
     /// fragments of size `FRAGMENT_SIZE`. The first byte of the first fragment is
-    /// used as the `group_id`.
+    /// used as the `message_id`.
     pub fn new<T: Encode>(value: &T) -> Result<Self, EncodeError> {
         let mut writer = FragmentWriter::<FRAGMENT_SIZE>::new();
         writer.encode(value)?;
 
-        let fragments = writer.finalize();
+        let (fragments, total_length) = writer.finalize();
 
-        // Extract the first byte as group ID safely.
+        // Extract the first byte as message ID safely.
         // `bincode` always encodes enums with a leading byte.
-        let group_id = fragments
+        let message_id = fragments
             .front()
             .and_then(|b| b.first())
             .copied()
-            .ok_or_else(|| {
-                EncodeError::OtherString("No data encoded into fragments".to_string())
-            })?;
+            .ok_or_else(|| EncodeError::OtherString("No data encoded into fragments".to_string()))?
+            as u16;
 
-        let total = fragments.len() as u64;
+        let chunk_count = fragments.len();
 
         Ok(Self {
             fragments,
-            group_id,
-            total,
+            message_id,
+            total_length,
+            chunk_count,
         })
     }
 }
@@ -184,9 +226,18 @@ impl<const FRAGMENT_SIZE: usize> Iterator for ChunkProducer<FRAGMENT_SIZE> {
     /// Each call to `next` yields the next chunk, along with its index and the
     /// total number of chunks. When all chunks have been consumed, it returns `None`.
     fn next(&mut self) -> Option<Self::Item> {
-        let index = self.total - self.fragments.len() as u64;
-        let bytes = self.fragments.pop_front()?;
-        let chunk = Chunk::new(self.group_id, index, self.total, Payload::from(bytes));
+        let index = self.chunk_count - self.fragments.len();
+        let message_id = self.message_id;
+        let data = Payload(self.fragments.pop_front()?);
+        let chunk = if index == 0 {
+            Chunk::Start {
+                message_id,
+                data,
+                total_length: self.total_length as u64,
+            }
+        } else {
+            Chunk::Data { message_id, data }
+        };
         Some(chunk)
     }
 }
@@ -227,8 +278,8 @@ impl ChunkReader {
 
     /// Returns the current chunk's payload as a byte slice.
     #[inline]
-    fn payload(&self) -> Option<&Bytes> {
-        self.chunks.get(self.chunk_index).map(|c| &c.payload.0)
+    fn payload(&self) -> Option<&[u8]> {
+        self.chunks.get(self.chunk_index).map(|c| c.data())
     }
 
     /// Advances to the next chunk if the current one is fully consumed.
@@ -273,16 +324,16 @@ impl Reader for ChunkReader {
     }
 }
 
-/// A queue that holds chunks grouped by `group_id` and allows random selection when popping.
+/// A queue that holds chunks grouped by `message_id` and allows random selection when popping.
 ///
 /// This structure is useful for sending chunked messages with a randomized group order
-/// while maintaining the order of chunks within a group.
+/// while maintaining the order of chunks within a message group.
 pub struct GroupChunkQueue {
-    // Maps group_id to its queued chunks
-    groups: HashMap<u8, VecDeque<Chunk>>,
+    // Maps message_id to its queued chunks
+    messages: HashMap<u16, VecDeque<Chunk>>,
 
-    // Active group IDs for random selection synced with `groups` keys
-    group_ids: Vec<u8>,
+    // Active message IDs for random selection synced with `messages` keys
+    message_ids: Vec<u16>,
 
     // Non-cryptographic RNG for quick random rotation
     rng: SmallRng,
@@ -291,45 +342,45 @@ pub struct GroupChunkQueue {
 impl GroupChunkQueue {
     pub fn new() -> Self {
         Self {
-            groups: HashMap::new(),
-            group_ids: Vec::new(),
+            messages: HashMap::new(),
+            message_ids: Vec::new(),
             rng: SmallRng::from_seed([0; 32]),
         }
     }
 
     /// Pushes a single chunk into the queue.
     pub fn push_chunk(&mut self, chunk: Chunk) {
-        let group_id = chunk.group_id;
+        let message_id = chunk.message_id();
 
-        // Get or create the queue for this group
-        let queue = self.groups.entry(group_id).or_default();
+        // Get or create the queue for this message_id
+        let queue = self.messages.entry(message_id).or_default();
 
-        // Sync the group_id if it is newly added
+        // Sync the message_id if it is newly added
         if queue.is_empty() {
-            self.group_ids.push(group_id);
+            self.message_ids.push(message_id);
         }
 
         queue.push_back(chunk);
     }
 
-    /// Pops the front chunk from a randomly selected active group
+    /// Pops the front chunk from a randomly selected active message group
     pub fn pop_random_chunk(&mut self) -> Option<Chunk> {
-        if self.group_ids.is_empty() {
+        if self.message_ids.is_empty() {
             return None;
         }
 
-        // Pick a random group index
-        let idx = self.rng.random_range(0..self.group_ids.len());
-        let group_id = self.group_ids[idx];
+        // Pick a random message group index
+        let idx = self.rng.random_range(0..self.message_ids.len());
+        let message_id = self.message_ids[idx];
 
         // Pop the first chunk from the selected group queue
-        let queue = self.groups.get_mut(&group_id)?;
+        let queue = self.messages.get_mut(&message_id)?;
         let chunk = queue.pop_front();
 
-        // Remove the group if it becomes empty
+        // Remove the message group if it becomes empty
         if queue.is_empty() {
-            self.groups.remove(&group_id);
-            self.group_ids.swap_remove(idx); // O(1) removal
+            self.messages.remove(&message_id);
+            self.message_ids.swap_remove(idx); // O(1) removal
         }
 
         chunk
@@ -337,48 +388,63 @@ impl GroupChunkQueue {
 
     /// Returns true if there are no chunks in any group
     pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
+        self.messages.is_empty()
     }
 }
 
-/// Collector for partially received chunks within groups.
+/// Collector for partially received chunks within message groups.
 ///
 /// This ensures that chunks are stored in order and can be assembled into a complete message.
 pub struct GroupChunkCollector {
-    // Maps group_id to its received chunks
-    groups: HashMap<u8, Vec<Chunk>>,
+    // Maps message_id to its received chunks
+    messages: HashMap<u16, Vec<Chunk>>,
+
+    // Tracks total bytes received per message
+    bytes_received: HashMap<u16, usize>,
 }
 
 impl GroupChunkCollector {
     pub fn new() -> Self {
         Self {
-            groups: HashMap::new(),
+            messages: HashMap::new(),
+            bytes_received: HashMap::new(),
         }
     }
 
-    /// Adds a chunk to the corresponding group.
+    /// Adds a chunk to the corresponding message group.
     ///
-    /// If this chunk completes its group, the function returns all collected chunks for that group.
+    /// If this chunk completes its group, the function returns all collected chunks for
+    /// that message group.
     ///
-    /// If a chunk with `index == 0` arrives, any previously collected chunks for that group are
+    /// If a start chunk arrives, any previously collected chunks for that message group are
     /// discarded.
     pub fn push(&mut self, chunk: Chunk) -> Option<Vec<Chunk>> {
-        // If a chunk with index 0 arrives, drop any previously collected chunks
-        if chunk.index == 0 && self.groups.contains_key(&chunk.group_id) {
-            // TODO: Handle or log discarded chunks
-            self.groups.remove(&chunk.group_id);
+        let message_id = chunk.message_id();
+
+        // If first chunk is Start, reset previous state
+        if chunk.is_start() {
+            self.messages.remove(&message_id);
+            self.bytes_received.insert(message_id, 0);
+            self.messages.insert(message_id, Vec::new());
         }
 
-        let entry = self.groups.entry(chunk.group_id).or_default();
-        entry.push(chunk.clone());
+        let chunk_length = chunk.len();
 
-        // Check if this is the last chunk of the group
-        if chunk.index + 1 == chunk.total {
-            // Take the completed group
-            let complete_chunks = self.groups.remove(&chunk.group_id).unwrap();
-            Some(complete_chunks)
-        } else {
-            None
+        let entry = self.messages.entry(message_id).or_default();
+        entry.push(chunk);
+
+        let bytes_received = self.bytes_received.entry(message_id).or_default();
+        *bytes_received += chunk_length;
+
+        // Check if this is the last chunk of the message
+        if let Some(Chunk::Start { total_length, .. }) = entry.first()
+            && *bytes_received >= *total_length as usize
+        {
+            // Message complete
+            self.bytes_received.remove(&message_id);
+            return self.messages.remove(&message_id);
         }
+
+        None
     }
 }

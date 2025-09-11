@@ -3,8 +3,8 @@ mod chunk;
 use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
-use std::time::{Duration, Instant};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use actix_codec::{Decoder, Encoder};
 use anyhow::Result;
@@ -14,10 +14,9 @@ use bincode::{Decode, Encode};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-
 
 use mirrord_macros::protocol_break;
 
