@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use actix_codec::{Decoder, Encoder};
 use anyhow::Result;
-use bincode::config::Configuration;
 use bincode::error::DecodeError;
 use bincode::{Decode, Encode};
 use bytes::{Buf, BufMut, BytesMut};
@@ -35,7 +34,7 @@ use mirrord_protocol::{
 #[allow(deprecated)]
 use mirrord_protocol::pause::DaemonPauseTarget;
 
-use crate::chunk::{Chunk, ChunkProducer, GroupChunkCollector, GroupChunkQueue};
+use crate::chunk::{Chunk, ChunkProducer, ChunkReader, GroupChunkCollector, GroupChunkQueue};
 
 const SERVER_ADDRESS: &str = "127.0.0.1:3333";
 
@@ -191,8 +190,6 @@ const CHUNK_SIZE: usize = 32 * 1024; // 32 KB
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    into_chunks();
-
     // Run server and client concurrently
     tokio::try_join!(run_server(), run_client())?;
     Ok(())
@@ -362,29 +359,4 @@ async fn measure_ping(framed: &mut Framed<TcpStream, ClientCodec>) -> Result<()>
     }
 
     Ok(())
-}
-
-use chunk::ChunkReader;
-
-#[allow(dead_code)]
-fn into_chunks() {
-    let msg = DaemonMessage::TcpOutgoing(DaemonTcpOutgoing::Read(Ok(DaemonRead {
-        connection_id: 0,
-        bytes: vec![0u8; 1_000_000].into(),
-    })));
-
-    let chunks: Vec<_> = ChunkProducer::<CHUNK_SIZE>::new(&msg).unwrap().collect();
-
-    println!("Message split into {} chunks.", chunks.len());
-
-    let mut reader = ChunkReader::new(chunks);
-
-    bincode::decode_from_reader::<DaemonMessage, &mut ChunkReader, Configuration>(
-        &mut reader,
-        bincode::config::standard(),
-    )
-    .map(|decoded_msg: DaemonMessage| {
-        println!("Decoded message: {:?}", decoded_msg);
-    })
-    .unwrap();
 }
