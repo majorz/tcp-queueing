@@ -88,132 +88,66 @@ impl Chunk {
     }
 }
 
-/// A writer that splits encoded data into fixed-size fragments.
-///
-/// `FragmentWriter` implements the `bincode::enc::write::Writer` trait,
-/// allowing it to be used with `bincode::encode_into_writer` to serialize
-/// arbitrary Rust values. The serialized data is collected into `Bytes`
-/// fragments of size `FRAGMENT_SIZE`.
-///
-/// This is useful for sending large messages over the network in fixed-size
-/// chunks.
-pub struct FragmentWriter<const FRAGMENT_SIZE: usize> {
-    /// Queue of fully encoded fragments
-    fragments: VecDeque<Bytes>,
-
-    /// Temporary storage for data being accumulated
-    pending_fragment: BytesMut,
-
-    /// Total length of data written
-    total_length: usize,
+/// Writer that appends encoded data into a `BytesMut`
+pub struct BytesMutWriter<'a> {
+    bytes: &'a mut BytesMut,
 }
 
-impl<const FRAGMENT_SIZE: usize> FragmentWriter<FRAGMENT_SIZE> {
-    pub fn new() -> Self {
-        Self {
-            fragments: VecDeque::new(),
-            pending_fragment: BytesMut::with_capacity(FRAGMENT_SIZE),
-            total_length: 0,
-        }
-    }
-
-    /// Encode a value using this writer and bincode standard config
-    pub fn encode<T: Encode>(&mut self, value: &T) -> Result<(), EncodeError> {
-        encode_into_writer(value, self, bincode::config::standard())
-    }
-
-    /// Consume this writer and return all completed fragments
-    pub fn finalize(mut self) -> (VecDeque<Bytes>, usize) {
-        self.flush_pending();
-        (self.fragments, self.total_length)
-    }
-
-    /// Flush the current pending fragment into the completed fragments queue
-    fn flush_pending(&mut self) {
-        if self.pending_fragment.is_empty() {
-            return;
-        }
-        self.total_length += self.pending_fragment.len();
-        let bytes = self.pending_fragment.split().freeze();
-        self.fragments.push_back(bytes);
-    }
-}
-
-impl<const FRAGMENT_SIZE: usize> Default for FragmentWriter<FRAGMENT_SIZE> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<const FRAGMENT_SIZE: usize> Writer for FragmentWriter<FRAGMENT_SIZE> {
-    /// Write bytes into the queue, splitting into fragments as needed
-    fn write(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
-        let mut remaining_data = bytes;
-
-        while !remaining_data.is_empty() {
-            let space_left_in_pending = FRAGMENT_SIZE - self.pending_fragment.len();
-
-            if remaining_data.len() >= space_left_in_pending {
-                // Fill pending fragment to full capacity
-                self.pending_fragment
-                    .extend_from_slice(&remaining_data[..space_left_in_pending]);
-                self.flush_pending();
-
-                // Move the slice forward
-                remaining_data = &remaining_data[space_left_in_pending..];
-            } else {
-                // All remaining data fits in the pending fragment
-                self.pending_fragment.extend_from_slice(remaining_data);
-                break;
-            }
-        }
-
+impl<'a> Writer for BytesMutWriter<'a> {
+    fn write(&mut self, data: &[u8]) -> Result<(), EncodeError> {
+        self.bytes.extend_from_slice(data);
         Ok(())
     }
 }
 
+impl<'a> BytesMutWriter<'a> {
+    pub fn new(bytes: &'a mut BytesMut) -> Self {
+        Self { bytes }
+    }
+}
+
+/// Encodes a value into a `BytesMut`, similar to `bincode::encode_to_vec`.
+pub fn encode_to_bytes_mut<T: Encode>(value: &T) -> Result<BytesMut, EncodeError> {
+    let mut bytes = BytesMut::new();
+
+    let mut writer = BytesMutWriter::new(&mut bytes);
+    encode_into_writer(value, &mut writer, bincode::config::standard())?;
+
+    Ok(bytes)
+}
+
 /// An iterator that produces `Chunk`s from a serializable value.
-///
-/// This iterator takes a value that implements `bincode::Encode`, serializes it into
-/// fixed-size fragments using `FragmentWriter` and then yields each fragment as `Chunk`
-///
-/// # Type Parameters
-/// - `FRAGMENT_SIZE`: The maximum size of each fragment in bytes.
 pub struct ChunkProducer<const FRAGMENT_SIZE: usize> {
-    fragments: VecDeque<Bytes>,
+    // The serialized message
+    buffer: BytesMut,
+
+    // Derived from the first byte of the serialized message
     message_id: u16,
+
+    // Total length of the original serialized message
     total_length: usize,
-    chunk_count: usize,
+
+    // Should Chunk::Start be produced
+    is_start_chunk: bool,
 }
 
 impl<const FRAGMENT_SIZE: usize> ChunkProducer<FRAGMENT_SIZE> {
-    /// Create a new `ChunkProducer` from a serializable value.
-    ///
-    /// This method serializes the given value using `bincode` and splits it into
-    /// fragments of size `FRAGMENT_SIZE`. The first byte of the first fragment is
-    /// used as the `message_id`.
+    /// Serialize a value into a `BytesMut` and prepare for chunking
     pub fn new<T: Encode>(value: &T) -> Result<Self, EncodeError> {
-        let mut writer = FragmentWriter::<FRAGMENT_SIZE>::new();
-        writer.encode(value)?;
+        let buffer = encode_to_bytes_mut(value)?;
+        let total_length = buffer.len();
 
-        let (fragments, total_length) = writer.finalize();
-
-        // Extract the first byte as message ID safely.
-        // `bincode` always encodes enums with a leading byte.
-        let message_id = fragments
-            .front()
-            .and_then(|b| b.first())
+        let message_id = buffer
+            .first()
             .copied()
-            .ok_or_else(|| EncodeError::OtherString("No data encoded into fragments".to_string()))?
+            .ok_or_else(|| EncodeError::OtherString("No data encoded".to_string()))?
             as u16;
 
-        let chunk_count = fragments.len();
-
         Ok(Self {
-            fragments,
+            buffer,
             message_id,
             total_length,
-            chunk_count,
+            is_start_chunk: true,
         })
     }
 }
@@ -221,23 +155,32 @@ impl<const FRAGMENT_SIZE: usize> ChunkProducer<FRAGMENT_SIZE> {
 impl<const FRAGMENT_SIZE: usize> Iterator for ChunkProducer<FRAGMENT_SIZE> {
     type Item = Chunk;
 
-    /// Return the next chunk.
-    ///
-    /// Each call to `next` yields the next chunk, along with its index and the
-    /// total number of chunks. When all chunks have been consumed, it returns `None`.
     fn next(&mut self) -> Option<Self::Item> {
-        let index = self.chunk_count - self.fragments.len();
-        let message_id = self.message_id;
-        let data = Payload(self.fragments.pop_front()?);
-        let chunk = if index == 0 {
+        if self.buffer.is_empty() {
+            return None;
+        }
+
+        // Determine size of this chunk
+        let chunk_size = FRAGMENT_SIZE.min(self.buffer.len());
+
+        // Split the chunk and freeze without extra allocation
+        let bytes = self.buffer.split_to(chunk_size).freeze();
+        let data = Payload(bytes);
+
+        let chunk = if self.is_start_chunk {
+            self.is_start_chunk = false;
             Chunk::Start {
-                message_id,
-                data,
+                message_id: self.message_id,
                 total_length: self.total_length as u64,
+                data,
             }
         } else {
-            Chunk::Data { message_id, data }
+            Chunk::Data {
+                message_id: self.message_id,
+                data,
+            }
         };
+
         Some(chunk)
     }
 }
